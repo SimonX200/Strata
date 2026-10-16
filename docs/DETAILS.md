@@ -1594,6 +1594,19 @@ test images.
 
 **Stager threads for a GGUF read in place (0.1.41, #1353):** a native pack read from its GGUF shards in place (UD-Q4_K_XL, a Q8_0 pack) copies each expert with 32 threads and a 128-deep ring when the bytes are page faults on an SSD. If the shards' pages are already in the page cache (a big-RAM box, a warm start) those copies are memory copies and the same profile ran 4-7x slower than the 4-thread default (a 124K-token Q8 prompt: 57 -> 350-410 tok/s with the default). The engine now checks a sample of the experts with `mincore` at the first prompt (Linux) and takes the RAM profile when 90% or more of their pages are resident, saying so in its log; a cold or partly cached GGUF keeps the SSD profile. `STRATA_STAGER_SSD=1` / `0` forces either profile; `STRATA_STAGER_THREADS` still wins. The bytes copied are the same.
 
+**The expert arena read can skip its FNV-1a (`STRATA_NO_LOAD_CHECKSUM=1`):** the buffered reader that fills the
+expert arena from `experts.bin` copies every chunk it read and runs an FNV-1a over it, one per layer, to name the
+layer a corrupt read came from. Nothing in the engine reads those checksums - only the `strata-load` tool prints
+them - and the hash is a serial byte loop worth about 1 byte per cycle, so it costs more than the copy beside it.
+Measured on a Ryzen 9 5950X with a Samsung PM9A1 (a file read warm from the page cache, 8 readers, 8 MiB chunks,
+that loop exactly): 4.4-4.9 GiB/s with the hash and 8.2-8.4 GiB/s without it, the hash 6.1 s of the 8.7 s of
+reader thread time a 4 GiB round costs - about half the readers' time, which is a whole engine start on a 55 GiB
+pack. The hash still runs by default and `STRATA_NO_LOAD_CHECKSUM=1` takes it out; `strata-load --no-checksum`
+does it for one run. The bytes that reach the arena are the same either way, which is what
+`tests/core/load_checksum_test.cpp` checks for both ways. `bench/micro/load_hash.cpp` runs that loop with the
+hash on and off, so the number can be re-measured on any PC. The unbuffered read (Windows) and the read straight
+from the GGUF never hashed.
+
 ## Short prompts: the CPU shares the experts (on by default on one NVIDIA GPU, `STRATA_PREFILL_CPU_SHARE`)
 
 A prompt chunk of a few thousand tokens (an agent's tool result, a test's output, a short follow-up) streams every routed

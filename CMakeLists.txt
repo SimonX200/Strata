@@ -514,6 +514,22 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     set_tests_properties(memory_guard_test PROPERTIES TIMEOUT 60)
   endif()
 
+  # The expert arena reader: its bytes, and the per-layer FNV-1a that is off by default (host code only)
+  if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/load_checksum_test.cpp")
+    add_executable(load_checksum_test tests/core/load_checksum_test.cpp)
+    target_include_directories(load_checksum_test PRIVATE include)
+    target_link_libraries(load_checksum_test PRIVATE strata_core Threads::Threads)
+    add_test(NAME load_checksum_test COMMAND load_checksum_test)
+    set_tests_properties(load_checksum_test PROPERTIES TIMEOUT 60)
+  endif()
+
+  # What the load's per-layer FNV-1a costs on a given PC (the number behind STRATA_NO_LOAD_CHECKSUM=1): the
+  # reader's loop, hash on and off, against a real file.  Built, not run, by CI - it wants a multi-GiB file.
+  if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench/micro/load_hash.cpp")
+    add_executable(load_hash bench/micro/load_hash.cpp)
+    target_link_libraries(load_hash PRIVATE Threads::Threads)
+  endif()
+
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/file_expert_source_test.cpp")
     enable_testing()
     add_executable(file_expert_source_test tests/core/file_expert_source_test.cpp)

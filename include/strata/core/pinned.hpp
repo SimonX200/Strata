@@ -91,7 +91,7 @@ struct LoadStats {
     // either can exceed `seconds` when the threads overlap.  They exist to separate the read from the copy and
     // the hash: an 8 MiB chunk that reaches the disk as ~2048 4 KiB reads spends its time in the first one.
     double read_seconds = 0.0;                  // inside the read call only: no seek, no copy, no hash
-    double copy_seconds = 0.0;                  // memcpy + FNV-1a
+    double copy_seconds = 0.0;                  // memcpy, plus the FNV-1a unless STRATA_NO_LOAD_CHECKSUM=1
     // A short read is not a slow load, it is a WRONG one: the caller must refuse the pack rather than run
     // on an arena whose tail was never written.  `seconds` alone cannot say that (it is -1.0 on failure, but
     // the caller's own check is on the REQUESTED byte count, which a refused read does not change).
@@ -99,7 +99,7 @@ struct LoadStats {
     std::string error;                          // why it failed, for the caller's message
     uint64_t bytes = 0;
     uint64_t layers = 0;
-    std::vector<uint64_t> layer_checksums;      // one FNV-1a per layer
+    std::vector<uint64_t> layer_checksums;      // one FNV-1a per layer, EMPTY only if the hash was turned off
     double gib_per_second() const { return seconds > 0 ? (double) bytes / (1024.0 * 1024 * 1024) / seconds : 0.0; }
     // Aggregate rate of the readers WHILE THEY WERE INSIDE THE READ CALL: `bytes` over the mean per-thread
     // read time.  `gib_per_second()` above divides the same bytes by the wall clock of the whole loop, which
@@ -119,10 +119,18 @@ struct LoadStats {
 // calls, so an 8 MiB `chunk` reached the disk as ~2048 4 KiB operations and the chunking did nothing at all
 // (measured on a 42.9 GB pack: 1222 s, 4096 bytes per operation, 0.03 GiB/s).  `fread()` hands a request
 // larger than the stream buffer straight to `_read()`/`ReadFile()`, which is what `chunk` is for.  The
-// control flow, the copy, the per-layer FNV-1a and therefore the checksums are unchanged, so a pack loaded
+// control flow, the copy and (with the checksums on) the per-layer FNV-1a are unchanged, so a pack loaded
 // by the old and the new reader must produce identical `layer_checksums`.
+//
+// `checksums`: hash what is read into `dst` and return one FNV-1a per layer.  That is the default and has
+// been since the reader existed; `STRATA_NO_LOAD_CHECKSUM=1` turns it off, because the hash is a serial byte
+// loop over every byte the reader just copied (~1 byte per cycle) and nothing in the engine reads the result.
+// Measured on a Ryzen 9 5950X with a Samsung PM9A1 (a file read warm from the page cache, 8 readers, 8 MiB
+// chunks, the loop of `load_experts_ranges` exactly): 4.4-4.9 GiB/s with the hash and 8.2-8.4 GiB/s without
+// it, the hash 6.1 s of the 8.7 s of reader thread time a 4 GiB round costs.  Which way the hash goes, the
+// bytes that reach `dst` are the same - tests/core/load_checksum_test.cpp compares them.
 LoadStats load_experts(const std::string& path, uint8_t* dst, uint64_t blob_bytes, uint64_t blobs_per_layer,
-                       uint64_t layers, int threads, uint64_t chunk);
+                       uint64_t layers, int threads, uint64_t chunk, bool checksums = true);
 /// Pin by need: the arena's page-aligned blob stride.  Layer L's blob e sits at `dst_off[L] + e * stride[L]` (stride =
 /// blob rounded up to 4 KiB, the pad is never read), instead of the packed `layer_off[L] + e * blob[L]`; the FILE
 /// offsets stay the packed ones.  Every blob then starts on a page, so any set of blobs registers exactly.
@@ -138,13 +146,14 @@ struct PadMap {
 /// `ready` (optional): layer L is written only once *ready > L + 1 - its slice and the next one registered (a
 /// PinnedArena registering its slices meanwhile: writing a page while cudaHostRegister runs on it corrupted the
 /// arena under WDDM, even on large pages; a layer boundary inside a page puts that page in both registrations).
+/// `checksums`: see `load_experts`; `STRATA_NO_LOAD_CHECKSUM=1` turns them off without the caller passing it.
 LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
                               const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk,
-                              const std::atomic<int>* ready = nullptr);
+                              const std::atomic<int>* ready = nullptr, bool checksums = true);
 /// (an overload, not a default argument: the SYCL build has its own pinned.dp.cpp that defines the signature above only)
 LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
                               const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk,
-                              const std::atomic<int>* ready, const PadMap* pad);
+                              const std::atomic<int>* ready, const PadMap* pad, bool checksums = true);
 
 /// The same ranges read UNBUFFERED straight into `dst` (Windows): no staging buffer and no file-cache copy - the
 /// drive's DMA lands where the experts live. Every range, `dst` and `chunk` must be 4 KiB aligned; returns ok =
@@ -169,6 +178,11 @@ bool experts_unbuffered(const std::vector<std::string>& files, uint64_t arena_by
 // FNV-1a 64.  Per layer, so a corrupt or short read names WHICH layer rather than just failing a whole-file
 // comparison - the same reason the Phase 1 tools report the first differing element.
 uint64_t fnv1a64(const uint8_t* p, uint64_t n, uint64_t seed = 1469598103934665603ull);
+
+/// Whether the readers should skip the hash they otherwise always do (see `load_experts` for what it costs).
+/// STRATA_NO_LOAD_CHECKSUM = unset/0: hash, which is what the reader has done since it existed; anything
+/// else: skip it.  Read once, so it cannot change under a running process.
+bool load_checksums_disabled();
 
 // ---- the expert stream -----------------------------------------------------
 //
