@@ -61,7 +61,3 @@ build-vision-cuda12.bat
 
 /.ccache/
 /.rocm-win/
-
-# VSCodium/Cline
-/.clinedocs/
-/.tools/
