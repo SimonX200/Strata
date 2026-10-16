@@ -20,6 +20,7 @@ int main(int argc, char** argv) {
     uint64_t blobs_per_layer = 512;
     bool pin = true;
     bool stream = false;
+    bool checksum = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -32,10 +33,13 @@ int main(int argc, char** argv) {
         else if (a == "--threads") threads = std::atoi(val());
         else if (a == "--chunk-mb") chunk = std::strtoull(val(), nullptr, 10) << 20;
         else if (a == "--no-pin") pin = false;
+        else if (a == "--checksum") checksum = true;
         else if (a == "--stream") stream = true;
         else if (a == "--help" || a == "-h") {
             std::printf("usage: strata-load --file experts.bin [--layers N] [--threads N] [--chunk-mb N]\n"
-                        "                   [--no-pin]\n");
+                        "                   [--no-pin] [--checksum]\n"
+                        "--checksum hashes what is read and prints one FNV-1a per layer; it costs about two\n"
+                        "thirds of the reader threads' time, so the load without it is the load the engine runs.\n");
             return 0;
         } else {
             std::fprintf(stderr, "unknown argument: %s\n", a.c_str());
@@ -64,7 +68,7 @@ int main(int argc, char** argv) {
     }
 
     const strata::core::LoadStats st =
-        strata::core::load_experts(path, dst, blob_bytes, blobs_per_layer, layers, threads, chunk);
+        strata::core::load_experts(path, dst, blob_bytes, blobs_per_layer, layers, threads, chunk, checksum);
     if (!st.ok) {
         std::fprintf(stderr, "loading the experts failed: %s\n", st.error.empty() ? "unknown" : st.error.c_str());
         return 1;
@@ -73,7 +77,8 @@ int main(int argc, char** argv) {
     std::printf("loaded %.3f GiB in %.3f s with %d threads and %llu MiB chunks  ->  %.2f GiB/s\n",
                 (double) st.bytes / (1024.0 * 1024 * 1024), st.seconds, threads,
                 (unsigned long long) (chunk >> 20), st.gib_per_second());
-    std::printf("per-layer checksums (FNV-1a 64):\n");
+    std::printf("per-layer checksums (FNV-1a 64):%s\n",
+                st.layer_checksums.empty() ? " NOT computed - pass --checksum (it costs ~2/3 of the readers' time)" : "");
     for (size_t i = 0; i < st.layer_checksums.size() && i < 4; ++i) {
         std::printf("  layer %zu  %016llx\n", i, (unsigned long long) st.layer_checksums[i]);
     }

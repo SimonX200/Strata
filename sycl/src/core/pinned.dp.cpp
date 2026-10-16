@@ -293,6 +293,14 @@ uint64_t fnv1a64(const uint8_t* p, uint64_t n, uint64_t seed) {
     return h;
 }
 
+bool load_checksums_requested() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_LOAD_CHECKSUM");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    return on;
+}
+
 namespace {
 /*
 DPCT1010: SYCL uses exceptions to report errors and does not use the error
@@ -593,10 +601,10 @@ PinnedArena::~PinnedArena() {
 }
 
 LoadStats load_experts(const std::string& path, uint8_t* dst, uint64_t blob_bytes, uint64_t blobs_per_layer,
-                       uint64_t layers, int threads, uint64_t chunk) {
+                       uint64_t layers, int threads, uint64_t chunk, bool checksums) {
     std::vector<uint64_t> off((size_t) layers), n((size_t) layers, blobs_per_layer * blob_bytes);
     for (uint64_t L = 0; L < layers; ++L) off[(size_t) L] = L * blobs_per_layer * blob_bytes;
-    return load_experts_ranges(path, dst, off, n, threads, chunk);
+    return load_experts_ranges(path, dst, off, n, threads, chunk, nullptr, checksums);
 }
 
 LoadStats load_experts_direct(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
@@ -745,16 +753,20 @@ bool experts_unbuffered(const std::vector<std::string>& files, uint64_t arena_by
 
 LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
                               const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk,
-                              const std::atomic<int>* ready) {
+                              const std::atomic<int>* ready, bool checksums) {
     LoadStats st;
     const uint64_t layers = (uint64_t) layer_off.size();
     st.layers = layers;
     st.bytes = 0;
     for (uint64_t b : layer_bytes) st.bytes += b;
     if (threads < 1) threads = 1;
+    // The per-layer hash is a diagnostic (see the header): a serial byte loop over everything the reader
+    // copies, worth ~1 byte per cycle.  Off unless a caller asks or STRATA_LOAD_CHECKSUM is set, so the
+    // engine's start pays for the read and the copy only.
+    const bool hashing = checksums || load_checksums_requested();
 
     const auto t0 = std::chrono::steady_clock::now();
-    std::vector<uint64_t> layer_hash((size_t) layers, 1469598103934665603ull);
+    std::vector<uint64_t> layer_hash(hashing ? (size_t) layers : 0, 1469598103934665603ull);
     std::atomic<uint64_t> next_layer{0};
     std::atomic<uint64_t> read_ns_sum{0};   // summed over the threads: see LoadStats::read_seconds
     std::atomic<uint64_t> copy_ns_sum{0};
@@ -815,13 +827,15 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
                 }
                 const auto t_copy = std::chrono::steady_clock::now();
                 std::memcpy(dst + off + pos, buf.data(), (size_t) n);
-                h = fnv1a64(buf.data(), n, h);
+                if (hashing)
+                    h = fnv1a64(buf.data(), n, h);   // over the staging buffer: `dst` is already written
                 copy_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
                                std::chrono::steady_clock::now() - t_copy).count();
                 pos += n;
                 remaining -= n;
             }
-            layer_hash[(size_t) L] = h;
+            if (hashing)
+                layer_hash[(size_t) L] = h;
         }
         read_ns_sum.fetch_add(read_ns);
         copy_ns_sum.fetch_add(copy_ns);

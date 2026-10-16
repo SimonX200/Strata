@@ -50,6 +50,7 @@
 #endif
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/uio.h>   // preadv / iovec: the gather read of the experts straight out of the GGUF
 #include <unistd.h>
 #endif
 #if defined(__linux__)
@@ -4406,6 +4407,17 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
 #else
     (void) unbuffered;
 #endif
+#if defined(_WIN32)
+    const bool gather = false;   // Windows has no preadv: it keeps the staging buffer below
+    (void) gather;
+#else
+    // The gather read (see the loop below): preadv() writes every expert straight into its arena blob.  On
+    // Linux this is the default, unless STRATA_EXPERT_GATHER=0 asks for the staging buffer again.
+    const bool gather = [] {
+        const char* e = std::getenv("STRATA_EXPERT_GATHER");
+        return e == nullptr || (e[0] != '\0' && e[0] != '0');
+    }();
+#endif
     auto worker = [&]() {
         // #230: `fread` on a `FILE*`, as load_experts_ranges (#89): MSVC's `std::ifstream::read` splits a request
         // into 4095-byte freads, which took this path to 0.02 GiB/s on a Windows install without experts.bin.
@@ -4416,6 +4428,9 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
         } file;
         std::string open_name;
         std::vector<uint8_t> buf;
+#ifndef _WIN32
+        std::vector<iovec> iov;   // the gather's destinations, rebuilt whenever preadv returns early
+#endif
         for (;;) {
             const int64_t l = next.fetch_add(1);
             if (l >= lay.n_layers || bad) break;
@@ -4437,9 +4452,35 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
                 const uint64_t src = lay.gguf_off[(size_t) (3 * l + r)];
                 const uint64_t total = per[r] * (uint64_t) lay.n_expert;
                 const uint64_t chunk = per[r] * 16;           // 16 experts per read
+#ifndef _WIN32
+                const uint64_t per_role = per[r];   // the gather's expert size; the staged read below uses per[r]
+#endif
                 buf.resize((size_t) chunk);
                 for (uint64_t done = 0; done < total; done += chunk) {
                     const uint64_t n = std::min<uint64_t>(chunk, total - done);
+#ifndef _WIN32
+                    // The gather: the file holds one role's experts back to back, the arena wants each of them
+                    // inside its own blob, so the staged read below copied every byte twice - once into the
+                    // staging buffer, once into the arena.  preadv() writes them where they belong in one
+                    // syscall, so the kernel's copy is the only one.  Measured on the UD-IQ4_XS pack (55.43 GiB,
+                    // 8 readers, 16 experts per read, warm page cache): 4.5 GiB/s staged, 6.8 GiB/s gathered,
+                    // 7.5 GiB/s for a read with no gather at all.  A short return is resumed where it stopped.
+                    if (gather && total % per_role == 0 && chunk % per_role == 0) {
+                        for (uint64_t in = 0; in < n; ) {
+                            iov.clear();
+                            for (uint64_t k = in / per_role; k < n / per_role; ++k) {
+                                const uint64_t skip = in > k * per_role ? in - k * per_role : 0;
+                                iov.push_back({(void*) (dst + dst_blob(l, (int64_t) (done / per_role + k)) +
+                                                        at[r] + skip), (size_t) (per_role - skip)});
+                            }
+                            const ssize_t got = ::preadv(::fileno(f), iov.data(), (int) iov.size(),
+                                                         (off_t) (src + done + in));
+                            if (got <= 0) { bad = true; return; }
+                            in += (uint64_t) got;
+                        }
+                        continue;
+                    }
+#endif
                     // 64-bit seek: a shard is tens of GB
                     if (STRATA_FSEEK64(f, src + done) != 0) { bad = true; return; }
                     if (std::fread(buf.data(), 1, (size_t) n, f) != (size_t) n) { bad = true; return; }
@@ -4718,6 +4759,16 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     if (std::getenv("STRATA_VERIFY_ARENA") != nullptr) {   // tests: the loaded arena's checksum, any loader
         std::fprintf(stderr, "strata generate: expert arena checksum %016llx (%.2f GiB)\n",
                      (unsigned long long) fnv1a64(a->data(), want), (double) want / (1ull << 30));
+    }
+    // STRATA_LOAD_CHECKSUM=1: the per-layer FNV-1a the reader produced, so a pack that reads wrong names the
+    // layer rather than the whole arena.  Printed only when they exist: hashing every byte read costs about
+    // two thirds of the readers' time (include/strata/core/pinned.hpp), which is why the load does not do it
+    // by default.
+    if (!st.layer_checksums.empty()) {
+        std::fprintf(stderr, "strata generate: per-layer FNV-1a of the arena, %zu layers:\n",
+                     st.layer_checksums.size());
+        for (size_t i = 0; i < st.layer_checksums.size(); ++i)
+            std::fprintf(stderr, "  layer %zu  %016llx\n", i, (unsigned long long) st.layer_checksums[i]);
     }
     // the first start: write experts.bin for the mapped starts after this one - only when the drive has room for it
     // and 2 GiB more (a full drive fails other writes too); otherwise this start says so and runs pinned as before

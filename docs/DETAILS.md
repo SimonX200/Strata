@@ -1594,6 +1594,25 @@ test images.
 
 **Stager threads for a GGUF read in place (0.1.41, #1353):** a native pack read from its GGUF shards in place (UD-Q4_K_XL, a Q8_0 pack) copies each expert with 32 threads and a 128-deep ring when the bytes are page faults on an SSD. If the shards' pages are already in the page cache (a big-RAM box, a warm start) those copies are memory copies and the same profile ran 4-7x slower than the 4-thread default (a 124K-token Q8 prompt: 57 -> 350-410 tok/s with the default). The engine now checks a sample of the experts with `mincore` at the first prompt (Linux) and takes the RAM profile when 90% or more of their pages are resident, saying so in its log; a cold or partly cached GGUF keeps the SSD profile. `STRATA_STAGER_SSD=1` / `0` forces either profile; `STRATA_STAGER_THREADS` still wins. The bytes copied are the same.
 
+**The expert arena read hashes nothing (opt-in `STRATA_LOAD_CHECKSUM=1`):** the buffered reader that fills the expert
+arena from `experts.bin` copied every chunk it read and ran an FNV-1a over it, one per layer, to name the layer a
+corrupt read came from. Nothing in the engine read those checksums - only the `strata-load` tool printed them - and the
+hash is a serial byte loop worth about 1 byte per cycle, so it cost more than the copy beside it. Measured on a Ryzen 9
+5950X with a Samsung PM9A1 (an 8 GiB file read warm from the page cache, 8 readers, 8 MiB chunks, that loop exactly):
+4.9 GiB/s with the hash and 8.4 GiB/s without it, the hash alone taking 8.6 s of the 13.2 s of reader thread time a
+round has. The load does not hash by default now; `STRATA_LOAD_CHECKSUM=1` puts it back and logs one checksum per
+layer, and `strata-load --checksum` asks for them there. The bytes that reach the arena are the same either way. The
+unbuffered read (Windows) and the read straight from the GGUF never hashed.
+
+**The GGUF expert read gathers instead of copying (opt-out `STRATA_EXPERT_GATHER=0`):** a native pack read in place
+from its GGUF shards holds one role's experts back to back, while the arena wants each expert inside its own blob - so
+the reader read 16 experts into a staging buffer and memcpy'd them apart, two copies of every one of the 55 GiB.
+`preadv()` writes those 16 experts where they belong in one syscall, so the kernel's copy is the only one. Measured on
+a Ryzen 9 5950X with a Samsung PM9A1 (the UD-IQ4_XS pack's 55.43 GiB, 8 readers, 16 experts per read, warm page
+cache): 4.5 GiB/s staged, 6.8 GiB/s gathered, 7.5 GiB/s for a read with no gather at all. Windows keeps the staged
+read (it has no `preadv`), and the bytes that land in the arena are the same either way - `expert_layout_test`
+compares every one of them. The FNV-1a above is not on this path: it never was.
+
 ## Short prompts: the CPU shares the experts (on by default on one NVIDIA GPU, `STRATA_PREFILL_CPU_SHARE`)
 
 A prompt chunk of a few thousand tokens (an agent's tool result, a test's output, a short follow-up) streams every routed
